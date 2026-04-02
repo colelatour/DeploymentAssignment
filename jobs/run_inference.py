@@ -1,7 +1,7 @@
 """
 Fraud prediction scoring job.
 
-Reads every order from shop.db, builds the 32-feature payload required
+Reads every order from Supabase, builds the 32-feature payload required
 by the XGBoost model (via modeling.py), and upserts fraud predictions
 into order_predictions. Falls back to simple heuristics if the .sav
 model file is not found.
@@ -13,7 +13,6 @@ Output (parsed by the Node API route):
 import json
 import math
 import os
-import sqlite3
 import sys
 from datetime import datetime, timezone
 
@@ -21,7 +20,37 @@ from datetime import datetime, timezone
 PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, PROJECT_ROOT)
 
-DB_PATH = os.path.join(PROJECT_ROOT, "shop.db")
+
+def _load_env_local() -> None:
+    """Parse .env.local and inject missing vars into os.environ (local dev fallback)."""
+    env_path = os.path.join(PROJECT_ROOT, ".env.local")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def get_supabase_client():
+    _load_env_local()
+    url = os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+    key = os.environ.get("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY")
+    if not url or not key:
+        print(json.dumps({"error": "Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY"}))
+        sys.exit(1)
+    try:
+        from supabase import create_client
+    except ImportError:
+        print(json.dumps({"error": "supabase package not installed. Run: pip install supabase"}))
+        sys.exit(1)
+    return create_client(url, key)
 
 
 def sigmoid(x: float) -> float:
@@ -61,10 +90,24 @@ def score_order_heuristic(row: dict) -> float:
     return round(sigmoid(raw - 1.5), 4)
 
 
+def parse_datetime(value: str | None, fmt: str = "%Y-%m-%dT%H:%M:%S") -> datetime | None:
+    """Parse a datetime string from Supabase (ISO 8601 variants)."""
+    if not value:
+        return None
+    # Try common Supabase formats
+    for f in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value[:26], f[:len(f)])
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def main() -> None:
-    if not os.path.exists(DB_PATH):
-        print(json.dumps({"error": f"Database not found: {DB_PATH}"}))
-        sys.exit(1)
+    client = get_supabase_client()
 
     # Try to import modeling.py and load the model
     use_model = False
@@ -76,147 +119,108 @@ def main() -> None:
     except (ImportError, FileNotFoundError) as e:
         print(json.dumps({"info": f"Model not available, using heuristic fallback: {e}"}), file=sys.stderr)
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
+    # Fetch all orders with nested customer and shipment data
+    orders_resp = client.table("orders").select(
+        "order_id, billing_zip, shipping_zip, shipping_state, payment_method, "
+        "device_type, ip_country, promo_used, order_subtotal, shipping_fee, "
+        "tax_amount, order_total, risk_score, order_datetime, customer_id, "
+        "customers(gender, city, state, customer_segment, loyalty_tier, is_active, birthdate), "
+        "shipments(carrier, shipping_method, distance_band, promised_days, actual_days, late_delivery)"
+    ).execute()
 
-    # Drop old table schema if it has the legacy columns
-    cur.execute("PRAGMA table_info(order_predictions)")
-    columns = [col[1] for col in cur.fetchall()]
-    if "late_delivery_probability" in columns:
-        cur.execute("DROP TABLE order_predictions")
+    orders = orders_resp.data or []
 
-    # Ensure the predictions table exists
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS order_predictions (
-            prediction_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id             INTEGER NOT NULL UNIQUE,
-            fraud_probability    REAL    NOT NULL,
-            predicted_fraud      INTEGER NOT NULL DEFAULT 0,
-            prediction_timestamp TEXT    NOT NULL,
-            FOREIGN KEY (order_id) REFERENCES orders(order_id)
-        )
-        """
-    )
+    # Fetch all order_items and aggregate by order_id in Python
+    items_resp = client.table("order_items").select(
+        "order_id, quantity, unit_price, product_id, line_total"
+    ).execute()
 
-    # Full query joining orders, customers, shipments, and order_items
-    orders = cur.execute(
-        """
-        SELECT
-            o.order_id,
-            o.billing_zip,
-            o.shipping_zip,
-            o.shipping_state,
-            o.payment_method,
-            o.device_type,
-            o.ip_country,
-            o.promo_used,
-            o.order_subtotal,
-            o.shipping_fee,
-            o.tax_amount,
-            o.order_total,
-            o.risk_score,
-            o.order_datetime,
-            c.gender,
-            c.city,
-            c.state              AS customer_state,
-            c.customer_segment,
-            c.loyalty_tier,
-            c.is_active          AS customer_is_active,
-            c.birthdate,
-            s.carrier,
-            s.shipping_method,
-            s.distance_band,
-            s.promised_days,
-            s.actual_days,
-            s.late_delivery,
-            COALESCE(oi.total_units, 0)        AS total_units,
-            COALESCE(oi.line_items, 0)         AS line_items,
-            COALESCE(oi.distinct_products, 0)  AS distinct_products,
-            COALESCE(oi.avg_unit_price, 0.0)   AS avg_unit_price,
-            COALESCE(oi.line_total_sum, 0.0)   AS line_total_sum
-        FROM orders o
-        JOIN customers c ON c.customer_id = o.customer_id
-        LEFT JOIN shipments s ON s.order_id = o.order_id
-        LEFT JOIN (
-            SELECT
-                order_id,
-                SUM(quantity)              AS total_units,
-                COUNT(*)                   AS line_items,
-                COUNT(DISTINCT product_id) AS distinct_products,
-                AVG(unit_price)            AS avg_unit_price,
-                SUM(line_total)            AS line_total_sum
-            FROM order_items
-            GROUP BY order_id
-        ) oi ON oi.order_id = o.order_id
-        """
-    ).fetchall()
+    items_by_order: dict[int, dict] = {}
+    for item in (items_resp.data or []):
+        oid = item["order_id"]
+        if oid not in items_by_order:
+            items_by_order[oid] = {
+                "total_units": 0,
+                "line_items": 0,
+                "distinct_products": set(),
+                "unit_prices": [],
+                "line_total_sum": 0.0,
+            }
+        agg = items_by_order[oid]
+        agg["total_units"] += item.get("quantity") or 0
+        agg["line_items"] += 1
+        if item.get("product_id"):
+            agg["distinct_products"].add(item["product_id"])
+        if item.get("unit_price") is not None:
+            agg["unit_prices"].append(item["unit_price"])
+        agg["line_total_sum"] += item.get("line_total") or 0.0
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     scored = 0
     errors = 0
+    predictions = []
 
     for order in orders:
-        row = dict(order)
+        customer = order.get("customers") or {}
+        shipment = order.get("shipments") or {}
+        agg = items_by_order.get(order["order_id"], {})
+
+        row = {
+            "order_id":          order["order_id"],
+            "billing_zip":       order.get("billing_zip") or "",
+            "shipping_zip":      order.get("shipping_zip") or "",
+            "shipping_state":    order.get("shipping_state") or "",
+            "payment_method":    order.get("payment_method") or "card",
+            "device_type":       order.get("device_type") or "desktop",
+            "ip_country":        order.get("ip_country") or "US",
+            "promo_used":        order.get("promo_used") or 0,
+            "order_subtotal":    order.get("order_subtotal") or 0.0,
+            "shipping_fee":      order.get("shipping_fee") or 0.0,
+            "tax_amount":        order.get("tax_amount") or 0.0,
+            "order_total":       order.get("order_total") or 0.0,
+            "risk_score":        order.get("risk_score") or 0.0,
+            "order_datetime":    order.get("order_datetime") or "",
+            "gender":            customer.get("gender") or "Unknown",
+            "city":              customer.get("city") or "",
+            "customer_state":    customer.get("state") or "",
+            "customer_segment":  customer.get("customer_segment") or "standard",
+            "loyalty_tier":      customer.get("loyalty_tier") or "none",
+            "customer_is_active": customer.get("is_active") if customer.get("is_active") is not None else 1,
+            "birthdate":         customer.get("birthdate"),
+            "carrier":           shipment.get("carrier") or "USPS",
+            "shipping_method":   shipment.get("shipping_method") or "standard",
+            "distance_band":     shipment.get("distance_band") or "regional",
+            "promised_days":     shipment.get("promised_days") if shipment.get("promised_days") is not None else 5,
+            "actual_days":       shipment.get("actual_days") if shipment.get("actual_days") is not None else 5,
+            "late_delivery":     shipment.get("late_delivery") if shipment.get("late_delivery") is not None else 0,
+            "total_units":       agg.get("total_units") or 0,
+            "line_items":        agg.get("line_items") or 0,
+            "distinct_products": len(agg.get("distinct_products") or set()),
+            "avg_unit_price":    (sum(agg["unit_prices"]) / len(agg["unit_prices"])) if agg.get("unit_prices") else 0.0,
+            "line_total_sum":    agg.get("line_total_sum") or 0.0,
+        }
 
         if use_model:
             try:
-                # Compute derived features
-                # customer_age: years from birthdate to order date
                 from datetime import date
                 if row["birthdate"]:
-                    birth = datetime.strptime(row["birthdate"], "%Y-%m-%d").date()
-                    order_date = datetime.strptime(row["order_datetime"][:10], "%Y-%m-%d").date()
+                    birth = datetime.strptime(row["birthdate"][:10], "%Y-%m-%d").date()
+                    order_date_str = row["order_datetime"][:10]
+                    order_date = datetime.strptime(order_date_str, "%Y-%m-%d").date()
                     age = (order_date - birth).days // 365
                 else:
-                    age = 30  # default
+                    age = 30
 
-                order_dt = datetime.strptime(row["order_datetime"], "%Y-%m-%d %H:%M:%S")
-                order_hour = order_dt.hour
-                order_dayofweek = order_dt.weekday()
+                order_dt = parse_datetime(row["order_datetime"])
+                order_hour = order_dt.hour if order_dt else 12
+                order_dayofweek = order_dt.weekday() if order_dt else 0
 
-                # Build the 32-feature payload
-                payload = {
-                    "billing_zip":       row["billing_zip"] or "",
-                    "shipping_zip":      row["shipping_zip"] or "",
-                    "shipping_state":    row["shipping_state"] or "",
-                    "payment_method":    row["payment_method"] or "card",
-                    "device_type":       row["device_type"] or "desktop",
-                    "ip_country":        row["ip_country"] or "US",
-                    "promo_used":        row["promo_used"] or 0,
-                    "order_subtotal":    row["order_subtotal"] or 0.0,
-                    "shipping_fee":      row["shipping_fee"] or 0.0,
-                    "tax_amount":        row["tax_amount"] or 0.0,
-                    "order_total":       row["order_total"] or 0.0,
-                    "risk_score":        row["risk_score"] or 0.0,
-                    "gender":            row["gender"] or "Unknown",
-                    "city":              row["city"] or "",
-                    "customer_state":    row["customer_state"] or "",
-                    "customer_segment":  row["customer_segment"] or "standard",
-                    "loyalty_tier":      row["loyalty_tier"] or "none",
-                    "customer_is_active": row["customer_is_active"] if row["customer_is_active"] is not None else 1,
-                    "carrier":           row["carrier"] or "USPS",
-                    "shipping_method":   row["shipping_method"] or "standard",
-                    "distance_band":     row["distance_band"] or "regional",
-                    "promised_days":     row["promised_days"] if row["promised_days"] is not None else 5,
-                    "actual_days":       row["actual_days"] if row["actual_days"] is not None else 5,
-                    "late_delivery":     row["late_delivery"] if row["late_delivery"] is not None else 0,
-                    "total_units":       row["total_units"],
-                    "line_items":        row["line_items"],
-                    "distinct_products": row["distinct_products"],
-                    "avg_unit_price":    row["avg_unit_price"],
-                    "line_total_sum":    row["line_total_sum"],
-                    "customer_age":      age,
-                    "order_hour":        order_hour,
-                    "order_dayofweek":   order_dayofweek,
-                }
+                payload = {**row, "customer_age": age, "order_hour": order_hour, "order_dayofweek": order_dayofweek}
 
                 result = predict_transaction(payload)
                 prob = result["fraud_probability"]
                 predicted_fraud = result["is_fraud"]
             except Exception as e:
-                # If model scoring fails for a row, fall back to heuristic
                 errors += 1
                 if errors <= 3:
                     print(json.dumps({"warning": f"Model error on order {row['order_id']}: {e}"}), file=sys.stderr)
@@ -226,23 +230,20 @@ def main() -> None:
             prob = score_order_heuristic(row)
             predicted_fraud = 1 if prob >= 0.5 else 0
 
-        cur.execute(
-            """
-            INSERT INTO order_predictions
-                (order_id, fraud_probability, predicted_fraud,
-                 prediction_timestamp)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(order_id) DO UPDATE SET
-                fraud_probability    = excluded.fraud_probability,
-                predicted_fraud      = excluded.predicted_fraud,
-                prediction_timestamp = excluded.prediction_timestamp
-            """,
-            (row["order_id"], prob, predicted_fraud, now),
-        )
+        predictions.append({
+            "order_id":             row["order_id"],
+            "fraud_probability":    prob,
+            "predicted_fraud":      predicted_fraud,
+            "prediction_timestamp": now,
+        })
         scored += 1
 
-    conn.commit()
-    conn.close()
+    # Batch upsert all predictions to Supabase
+    if predictions:
+        client.table("order_predictions").upsert(
+            predictions,
+            on_conflict="order_id"
+        ).execute()
 
     output = {"scored": scored, "timestamp": now}
     if errors:
