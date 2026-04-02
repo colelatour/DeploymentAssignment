@@ -14,6 +14,7 @@ import json
 import math
 import os
 import sys
+import traceback
 from datetime import datetime, timezone
 
 # Allow importing modeling.py from the project root
@@ -252,4 +253,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(json.dumps({"error": str(exc), "traceback": traceback.format_exc()}))
+        sys.exit(1)
