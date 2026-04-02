@@ -1,13 +1,12 @@
 """
 Fraud prediction scoring job.
 
-Reads every order from Supabase, builds the 32-feature payload required
-by the XGBoost model (via modeling.py), and upserts fraud predictions
-into order_predictions. Falls back to simple heuristics if the .sav
-model file is not found.
+Reads order data from stdin as a JSON array, scores each order using the
+XGBoost model (via modeling.py), and writes predictions to stdout as JSON.
+Falls back to simple heuristics if the .sav model file is not found.
 
-Output (parsed by the Node API route):
-  {"scored": <int>, "timestamp": "<ISO 8601>"}
+Input (stdin):  JSON array of order objects
+Output (stdout): {"scored": <int>, "predictions": [...], "timestamp": "<ISO>"}
 """
 
 import json
@@ -17,95 +16,45 @@ import sys
 import traceback
 from datetime import datetime, timezone
 
-# Force unbuffered output so nothing is lost if the process crashes
-sys.stdout.reconfigure(line_buffering=True)
-
-# Allow importing modeling.py from the project root
 PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, PROJECT_ROOT)
 
 
-def _step(msg: str) -> None:
-    """Print a progress checkpoint to stderr (always visible)."""
-    print(json.dumps({"step": msg}), file=sys.stderr, flush=True)
-
-
-def _load_env_local() -> None:
-    """Parse .env.local and inject missing vars into os.environ (local dev fallback)."""
-    env_path = os.path.join(PROJECT_ROOT, ".env.local")
-    if not os.path.exists(env_path):
-        return
-    with open(env_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
-                os.environ[key] = value
-
-
-def get_supabase_client():
-    _load_env_local()
-    url = os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
-    key = os.environ.get("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY")
-    if not url or not key:
-        print(json.dumps({"error": "Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY"}), flush=True)
-        sys.exit(1)
-    try:
-        from supabase import create_client
-    except ImportError:
-        print(json.dumps({"error": "supabase package not installed. Run: pip install supabase"}), flush=True)
-        sys.exit(1)
-    return create_client(url, key)
-
-
 def sigmoid(x: float) -> float:
-    """Squash a raw score into (0, 1)."""
     return 1.0 / (1.0 + math.exp(-x))
 
 
 def score_order_heuristic(row: dict) -> float:
-    """Return a fraud probability in [0, 1] for one order (fallback heuristic)."""
     raw = 0.0
-
     if row["order_total"] > 500:
         raw += 1.2
     elif row["order_total"] > 200:
         raw += 0.6
-
     if row["ip_country"] != "US":
         raw += 1.5
-
     if row["payment_method"] == "crypto":
         raw += 0.8
     elif row["payment_method"] == "bank":
         raw += 0.3
-
     if row["promo_used"]:
         raw += 0.4
-
     if row["device_type"] == "mobile":
         raw += 0.3
-
     risk_score = row.get("risk_score") or 0
     if risk_score > 70:
         raw += 1.5
     elif risk_score > 40:
         raw += 0.7
-
     return round(sigmoid(raw - 1.5), 4)
 
 
-def parse_datetime(value: str | None) -> datetime | None:
-    """Parse a datetime string from Supabase (ISO 8601 variants)."""
+def parse_datetime(value):
     if not value:
         return None
-    for f in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:
-            return datetime.strptime(value[:26], f[:len(f)])
+            return datetime.strptime(value[:26], fmt[:len(fmt)])
         except ValueError:
             continue
     try:
@@ -114,70 +63,28 @@ def parse_datetime(value: str | None) -> datetime | None:
         return None
 
 
-def main() -> None:
-    _step("connecting to supabase")
-    client = get_supabase_client()
+def main():
+    # Read order data from stdin (provided by the Node.js API route)
+    raw = sys.stdin.read()
+    orders = json.loads(raw)
 
-    _step("loading model")
+    # Try to load the XGBoost model
     use_model = False
     try:
         from modeling import predict_transaction, load_model
         load_model()
         use_model = True
-        _step("model loaded")
+        print(json.dumps({"info": "Using XGBoost model"}), file=sys.stderr)
     except (ImportError, FileNotFoundError) as e:
-        _step(f"model unavailable, using heuristic: {e}")
-
-    _step("fetching orders")
-    orders_resp = client.table("orders").select(
-        "order_id, billing_zip, shipping_zip, shipping_state, payment_method, "
-        "device_type, ip_country, promo_used, order_subtotal, shipping_fee, "
-        "tax_amount, order_total, risk_score, order_datetime, customer_id, "
-        "customers(gender, city, state, customer_segment, loyalty_tier, is_active, birthdate), "
-        "shipments(carrier, shipping_method, distance_band, promised_days, actual_days, late_delivery)"
-    ).execute()
-    orders = orders_resp.data or []
-    _step(f"fetched {len(orders)} orders")
-
-    _step("fetching order_items")
-    items_resp = client.table("order_items").select(
-        "order_id, quantity, unit_price, product_id, line_total"
-    ).execute()
-
-    items_by_order: dict[int, dict] = {}
-    for item in (items_resp.data or []):
-        oid = item["order_id"]
-        if oid not in items_by_order:
-            items_by_order[oid] = {
-                "total_units": 0,
-                "line_items": 0,
-                "distinct_products": set(),
-                "unit_prices": [],
-                "line_total_sum": 0.0,
-            }
-        agg = items_by_order[oid]
-        agg["total_units"] += item.get("quantity") or 0
-        agg["line_items"] += 1
-        if item.get("product_id"):
-            agg["distinct_products"].add(item["product_id"])
-        if item.get("unit_price") is not None:
-            agg["unit_prices"].append(item["unit_price"])
-        agg["line_total_sum"] += item.get("line_total") or 0.0
-    _step(f"fetched order_items for {len(items_by_order)} orders")
+        print(json.dumps({"info": f"Using heuristic fallback: {e}"}), file=sys.stderr)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    scored = 0
-    errors = 0
     predictions = []
+    errors = 0
 
-    _step("scoring orders")
     for order in orders:
-        customer = order.get("customers") or {}
-        shipment = order.get("shipments") or {}
-        agg = items_by_order.get(order["order_id"], {})
-
         row = {
-            "order_id":           order["order_id"],
+            "order_id":           order.get("order_id"),
             "billing_zip":        order.get("billing_zip") or "",
             "shipping_zip":       order.get("shipping_zip") or "",
             "shipping_state":     order.get("shipping_state") or "",
@@ -191,24 +98,24 @@ def main() -> None:
             "order_total":        order.get("order_total") or 0.0,
             "risk_score":         order.get("risk_score") or 0.0,
             "order_datetime":     order.get("order_datetime") or "",
-            "gender":             customer.get("gender") or "Unknown",
-            "city":               customer.get("city") or "",
-            "customer_state":     customer.get("state") or "",
-            "customer_segment":   customer.get("customer_segment") or "standard",
-            "loyalty_tier":       customer.get("loyalty_tier") or "none",
-            "customer_is_active": customer.get("is_active") if customer.get("is_active") is not None else 1,
-            "birthdate":          customer.get("birthdate"),
-            "carrier":            shipment.get("carrier") or "USPS",
-            "shipping_method":    shipment.get("shipping_method") or "standard",
-            "distance_band":      shipment.get("distance_band") or "regional",
-            "promised_days":      shipment.get("promised_days") if shipment.get("promised_days") is not None else 5,
-            "actual_days":        shipment.get("actual_days") if shipment.get("actual_days") is not None else 5,
-            "late_delivery":      shipment.get("late_delivery") if shipment.get("late_delivery") is not None else 0,
-            "total_units":        agg.get("total_units") or 0,
-            "line_items":         agg.get("line_items") or 0,
-            "distinct_products":  len(agg.get("distinct_products") or set()),
-            "avg_unit_price":     (sum(agg["unit_prices"]) / len(agg["unit_prices"])) if agg.get("unit_prices") else 0.0,
-            "line_total_sum":     agg.get("line_total_sum") or 0.0,
+            "gender":             order.get("gender") or "Unknown",
+            "city":               order.get("city") or "",
+            "customer_state":     order.get("customer_state") or "",
+            "customer_segment":   order.get("customer_segment") or "standard",
+            "loyalty_tier":       order.get("loyalty_tier") or "none",
+            "customer_is_active": order.get("customer_is_active") if order.get("customer_is_active") is not None else 1,
+            "birthdate":          order.get("birthdate"),
+            "carrier":            order.get("carrier") or "USPS",
+            "shipping_method":    order.get("shipping_method") or "standard",
+            "distance_band":      order.get("distance_band") or "regional",
+            "promised_days":      order.get("promised_days") if order.get("promised_days") is not None else 5,
+            "actual_days":        order.get("actual_days") if order.get("actual_days") is not None else 5,
+            "late_delivery":      order.get("late_delivery") if order.get("late_delivery") is not None else 0,
+            "total_units":        order.get("total_units") or 0,
+            "line_items":         order.get("line_items") or 0,
+            "distinct_products":  order.get("distinct_products") or 0,
+            "avg_unit_price":     order.get("avg_unit_price") or 0.0,
+            "line_total_sum":     order.get("line_total_sum") or 0.0,
         }
 
         if use_model:
@@ -231,7 +138,7 @@ def main() -> None:
             except Exception as e:
                 errors += 1
                 if errors <= 3:
-                    print(json.dumps({"warning": f"Model error on order {row['order_id']}: {e}"}), file=sys.stderr, flush=True)
+                    print(json.dumps({"warning": f"Model error on order {row['order_id']}: {e}"}), file=sys.stderr)
                 prob = score_order_heuristic(row)
                 predicted_fraud = 1 if prob >= 0.5 else 0
         else:
@@ -244,25 +151,16 @@ def main() -> None:
             "predicted_fraud":      predicted_fraud,
             "prediction_timestamp": now,
         })
-        scored += 1
 
-    _step(f"writing {len(predictions)} predictions to supabase")
-    if predictions:
-        client.table("order_predictions").upsert(
-            predictions,
-            on_conflict="order_id"
-        ).execute()
-
-    output = {"scored": scored, "timestamp": now}
+    output = {"scored": len(predictions), "predictions": predictions, "timestamp": now}
     if errors:
         output["model_errors"] = errors
-    print(json.dumps(output), flush=True)
-    _step("done")
+    print(json.dumps(output))
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(json.dumps({"error": str(exc), "traceback": traceback.format_exc()}), flush=True)
+        print(json.dumps({"error": str(exc), "traceback": traceback.format_exc()}))
         sys.exit(1)
