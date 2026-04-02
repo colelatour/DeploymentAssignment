@@ -64,7 +64,7 @@ function runPython(): Promise<{ stdout: string; stderr: string }> {
     const tryCommand = (cmd: string) => {
       execFile(
         cmd,
-        [SCRIPT],
+        ["-u", SCRIPT],
         {
           timeout: TIMEOUT_MS,
           maxBuffer: 2 * 1024 * 1024, // 2 MB
