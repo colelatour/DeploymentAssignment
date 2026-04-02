@@ -45,9 +45,13 @@ export async function POST() {
       err && typeof err === "object" && "stderr" in err
         ? String((err as { stderr: unknown }).stderr).trim()
         : null;
+    const stdout =
+      err && typeof err === "object" && "stdout" in err
+        ? String((err as { stdout: unknown }).stdout).trim()
+        : null;
 
     return NextResponse.json(
-      { status: "error", message, stderr },
+      { status: "error", message, stderr, stdout },
       { status: 500 }
     );
   }
@@ -77,7 +81,8 @@ function runPython(): Promise<{ stdout: string; stderr: string }> {
               return;
             }
             // Attach stderr to the error for the caller
-            (error as Error & { stderr?: string }).stderr = stderr;
+            (error as Error & { stderr?: string; stdout?: string }).stderr = stderr;
+            (error as Error & { stderr?: string; stdout?: string }).stdout = stdout;
             reject(error);
             return;
           }

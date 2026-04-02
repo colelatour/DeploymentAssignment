@@ -121,6 +121,26 @@ export default function ScoringPanel() {
             </tbody>
           </table>
 
+          {result.stdout && (
+            <details open className="mt-1">
+              <summary className="text-muted" style={{ cursor: "pointer" }}>
+                stdout output
+              </summary>
+              <pre
+                style={{
+                  fontSize: "0.8rem",
+                  background: "#fef2f2",
+                  padding: "0.5rem",
+                  borderRadius: "4px",
+                  overflowX: "auto",
+                  marginTop: "0.5rem",
+                }}
+              >
+                {result.stdout}
+              </pre>
+            </details>
+          )}
+
           {result.stderr && (
             <details open className="mt-1">
               <summary className="text-muted" style={{ cursor: "pointer" }}>
