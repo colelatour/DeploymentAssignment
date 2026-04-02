@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { queryOne, queryAll } from "@/lib/db";
+import { supabase } from "@/lib/db";
 import { getCustomerId } from "@/lib/getCustomerId";
 
 /* ── Types ─────────────────────────────────────────────── */
@@ -16,42 +16,12 @@ interface Customer {
   created_at: string;
 }
 
-interface OrderSummary {
-  total_orders: number;
-  total_spent: number;
-}
-
-interface RecentOrder {
+interface OrderRow {
   order_id: number;
   order_datetime: string;
   order_total: number;
-  fulfilled: number; // 1 if a shipment row exists, 0 otherwise
+  shipments: { shipment_id: number }[] | null;
 }
-
-/* ── SQL ───────────────────────────────────────────────── */
-
-// Customer profile
-// SELECT customer_id, full_name, email, city, state, zip_code,
-//        customer_segment, loyalty_tier, created_at
-// FROM   customers
-// WHERE  customer_id = ?
-
-// Aggregate totals
-// SELECT COUNT(*)              AS total_orders,
-//        COALESCE(SUM(order_total), 0) AS total_spent
-// FROM   orders
-// WHERE  customer_id = ?
-
-// 5 most recent orders with fulfilment status
-// SELECT o.order_id,
-//        o.order_datetime,
-//        o.order_total,
-//        CASE WHEN s.shipment_id IS NOT NULL THEN 1 ELSE 0 END AS fulfilled
-// FROM   orders o
-// LEFT JOIN shipments s ON s.order_id = o.order_id
-// WHERE  o.customer_id = ?
-// ORDER BY o.order_datetime DESC
-// LIMIT  5
 
 /* ── Page ──────────────────────────────────────────────── */
 
@@ -61,38 +31,43 @@ export default async function DashboardPage() {
     redirect("/select-customer");
   }
 
-  const customer = queryOne<Customer>(
-    `SELECT customer_id, full_name, email, city, state, zip_code,
-            customer_segment, loyalty_tier, created_at
-     FROM   customers
-     WHERE  customer_id = ?`,
-    [customerId]
-  );
+  const { data: customer } = await supabase
+    .from("customers")
+    .select(
+      "customer_id, full_name, email, city, state, zip_code, customer_segment, loyalty_tier, created_at"
+    )
+    .eq("customer_id", customerId)
+    .single<Customer>();
 
   if (!customer) {
     redirect("/select-customer");
   }
 
-  const summary = queryOne<OrderSummary>(
-    `SELECT COUNT(*)                       AS total_orders,
-            COALESCE(SUM(order_total), 0)  AS total_spent
-     FROM   orders
-     WHERE  customer_id = ?`,
-    [customerId]
-  )!;
+  // Fetch all orders for summary stats
+  const { data: allOrders } = await supabase
+    .from("orders")
+    .select("order_total")
+    .eq("customer_id", customerId);
 
-  const recentOrders = queryAll<RecentOrder>(
-    `SELECT o.order_id,
-            o.order_datetime,
-            o.order_total,
-            CASE WHEN s.shipment_id IS NOT NULL THEN 1 ELSE 0 END AS fulfilled
-     FROM   orders o
-     LEFT JOIN shipments s ON s.order_id = o.order_id
-     WHERE  o.customer_id = ?
-     ORDER BY o.order_datetime DESC
-     LIMIT  5`,
-    [customerId]
-  );
+  const totalOrders = allOrders?.length ?? 0;
+  const totalSpent =
+    allOrders?.reduce((sum, o) => sum + o.order_total, 0) ?? 0;
+
+  // Fetch 5 most recent orders with fulfillment status
+  const { data: recentRaw } = await supabase
+    .from("orders")
+    .select("order_id, order_datetime, order_total, shipments(shipment_id)")
+    .eq("customer_id", customerId)
+    .order("order_datetime", { ascending: false })
+    .limit(5)
+    .returns<OrderRow[]>();
+
+  const recentOrders = (recentRaw ?? []).map((o) => ({
+    order_id: o.order_id,
+    order_datetime: o.order_datetime,
+    order_total: o.order_total,
+    fulfilled: o.shipments && o.shipments.length > 0 ? 1 : 0,
+  }));
 
   return (
     <div>
@@ -121,12 +96,12 @@ export default async function DashboardPage() {
         <h2>Order Summary</h2>
         <div className="flex-gap">
           <div>
-            <strong>{summary.total_orders}</strong>
+            <strong>{totalOrders}</strong>
             <br />
             <span className="text-muted">Total Orders</span>
           </div>
           <div>
-            <strong>${summary.total_spent.toFixed(2)}</strong>
+            <strong>${totalSpent.toFixed(2)}</strong>
             <br />
             <span className="text-muted">Total Spend</span>
           </div>

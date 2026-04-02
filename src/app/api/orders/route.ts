@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { run, queryOne, transaction } from "@/lib/db";
+import { supabase } from "@/lib/db";
 
 interface LineItem {
   product_id: number;
@@ -45,17 +45,18 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  const customer = queryOne<{ zip_code: string; state: string }>(
-    "SELECT zip_code, state FROM customers WHERE customer_id = ?",
-    [customer_id]
-  );
+  const { data: customer } = await supabase
+    .from("customers")
+    .select("zip_code, state")
+    .eq("customer_id", customer_id)
+    .single<{ zip_code: string; state: string }>();
+
   if (!customer) {
     return NextResponse.json({ error: "Customer not found" }, { status: 404 });
   }
 
   /* ── Compute totals ──────────────────────────────────── */
 
-  // total_value = sum of (price * quantity) across all line items
   const totalValue = items.reduce(
     (sum, i) => sum + i.unit_price * i.quantity,
     0
@@ -65,53 +66,55 @@ export async function POST(req: NextRequest) {
   const orderTotal = totalValue + tax + shipping;
   const now = new Date().toISOString().replace("T", " ").slice(0, 19);
 
-  /* ── Transactional insert ────────────────────────────── */
-  //
-  // INSERT INTO orders  (...) VALUES (...)   -- one row
-  // INSERT INTO order_items (...) VALUES (...)  -- one row per line item
-  //
-  // Both run inside a single transaction so either all succeed
-  // or nothing is written.
+  /* ── Insert order ────────────────────────────────────── */
 
   try {
-    const orderId = transaction(() => {
-      const orderResult = run(
-        `INSERT INTO orders
-           (customer_id, order_datetime, billing_zip, shipping_zip,
-            shipping_state, payment_method, device_type, ip_country,
-            promo_used, order_subtotal, shipping_fee, tax_amount,
-            order_total, risk_score, is_fraud)
-         VALUES (?, ?, ?, ?, ?, 'card', 'desktop', 'US', 0,
-                 ?, ?, ?, ?, 0, 0)`,
-        [
-          customer_id,
-          now,
-          customer.zip_code,
-          customer.zip_code,
-          customer.state,
-          totalValue,
-          shipping,
-          tax,
-          orderTotal,
-        ]
-      );
+    const { data: orderData, error: orderError } = await supabase
+      .from("orders")
+      .insert({
+        customer_id,
+        order_datetime: now,
+        billing_zip: customer.zip_code,
+        shipping_zip: customer.zip_code,
+        shipping_state: customer.state,
+        payment_method: "card",
+        device_type: "desktop",
+        ip_country: "US",
+        promo_used: 0,
+        order_subtotal: totalValue,
+        shipping_fee: shipping,
+        tax_amount: tax,
+        order_total: orderTotal,
+        risk_score: 0,
+        is_fraud: 0,
+      })
+      .select("order_id")
+      .single<{ order_id: number }>();
 
-      const id = orderResult.lastInsertRowid;
+    if (orderError || !orderData) {
+      throw new Error(orderError?.message ?? "Failed to insert order");
+    }
 
-      for (const item of items) {
-        const lineTotal = item.unit_price * item.quantity;
-        run(
-          `INSERT INTO order_items
-             (order_id, product_id, quantity, unit_price, line_total)
-           VALUES (?, ?, ?, ?, ?)`,
-          [id, item.product_id, item.quantity, item.unit_price, lineTotal]
-        );
-      }
+    const orderId = orderData.order_id;
 
-      return id;
-    });
+    // Insert line items
+    const lineItems = items.map((item) => ({
+      order_id: orderId,
+      product_id: item.product_id,
+      quantity: item.quantity,
+      unit_price: item.unit_price,
+      line_total: item.unit_price * item.quantity,
+    }));
 
-    return NextResponse.json({ order_id: Number(orderId) });
+    const { error: itemsError } = await supabase
+      .from("order_items")
+      .insert(lineItems);
+
+    if (itemsError) {
+      throw new Error(itemsError.message);
+    }
+
+    return NextResponse.json({ order_id: orderId });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return NextResponse.json(

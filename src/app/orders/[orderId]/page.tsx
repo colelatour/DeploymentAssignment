@@ -1,45 +1,23 @@
 import { redirect, notFound } from "next/navigation";
 import Link from "next/link";
-import { queryOne, queryAll } from "@/lib/db";
+import { supabase } from "@/lib/db";
 import { getCustomerId } from "@/lib/getCustomerId";
 
 /* ── Types ─────────────────────────────────────────────── */
 
-interface Order {
+interface OrderRaw {
   order_id: number;
   order_datetime: string;
   order_total: number;
-  fulfilled: number;
+  shipments: { shipment_id: number }[] | null;
 }
 
-interface LineItem {
-  product_name: string;
+interface LineItemRaw {
   quantity: number;
   unit_price: number;
   line_total: number;
+  products: { product_name: string };
 }
-
-/* ── SQL ───────────────────────────────────────────────── */
-//
-// -- Order header (verified against customer_id for safety)
-// SELECT o.order_id,
-//        o.order_datetime,
-//        o.order_total,
-//        CASE WHEN s.shipment_id IS NOT NULL THEN 1 ELSE 0 END AS fulfilled
-// FROM   orders o
-// LEFT JOIN shipments s ON s.order_id = o.order_id
-// WHERE  o.order_id = ? AND o.customer_id = ?
-//
-// -- Line items
-// SELECT p.product_name,
-//        oi.quantity,
-//        oi.unit_price,
-//        oi.line_total
-// FROM   order_items oi
-// JOIN   products p ON p.product_id = oi.product_id
-// WHERE  oi.order_id = ?
-// ORDER BY oi.order_item_id
-//
 
 /* ── Page ──────────────────────────────────────────────── */
 
@@ -59,32 +37,38 @@ export default async function OrderDetailPage({
     notFound();
   }
 
-  const order = queryOne<Order>(
-    `SELECT o.order_id,
-            o.order_datetime,
-            o.order_total,
-            CASE WHEN s.shipment_id IS NOT NULL THEN 1 ELSE 0 END AS fulfilled
-     FROM   orders o
-     LEFT JOIN shipments s ON s.order_id = o.order_id
-     WHERE  o.order_id = ? AND o.customer_id = ?`,
-    [id, customerId]
-  );
+  const { data: orderRaw } = await supabase
+    .from("orders")
+    .select("order_id, order_datetime, order_total, shipments(shipment_id)")
+    .eq("order_id", id)
+    .eq("customer_id", customerId)
+    .single<OrderRaw>();
 
-  if (!order) {
+  if (!orderRaw) {
     notFound();
   }
 
-  const lineItems = queryAll<LineItem>(
-    `SELECT p.product_name,
-            oi.quantity,
-            oi.unit_price,
-            oi.line_total
-     FROM   order_items oi
-     JOIN   products p ON p.product_id = oi.product_id
-     WHERE  oi.order_id = ?
-     ORDER BY oi.order_item_id`,
-    [id]
-  );
+  const order = {
+    order_id: orderRaw.order_id,
+    order_datetime: orderRaw.order_datetime,
+    order_total: orderRaw.order_total,
+    fulfilled:
+      orderRaw.shipments && orderRaw.shipments.length > 0 ? 1 : 0,
+  };
+
+  const { data: lineItemsRaw } = await supabase
+    .from("order_items")
+    .select("quantity, unit_price, line_total, products(product_name)")
+    .eq("order_id", id)
+    .order("order_item_id")
+    .returns<LineItemRaw[]>();
+
+  const lineItems = (lineItemsRaw ?? []).map((li) => ({
+    product_name: li.products.product_name,
+    quantity: li.quantity,
+    unit_price: li.unit_price,
+    line_total: li.line_total,
+  }));
 
   return (
     <div>
@@ -98,11 +82,15 @@ export default async function OrderDetailPage({
         <table>
           <tbody>
             <tr>
-              <td><strong>Date</strong></td>
+              <td>
+                <strong>Date</strong>
+              </td>
               <td>{order.order_datetime}</td>
             </tr>
             <tr>
-              <td><strong>Fulfilled</strong></td>
+              <td>
+                <strong>Fulfilled</strong>
+              </td>
               <td>
                 <span
                   className={`badge ${order.fulfilled ? "green" : "yellow"}`}
@@ -112,7 +100,9 @@ export default async function OrderDetailPage({
               </td>
             </tr>
             <tr>
-              <td><strong>Order Total</strong></td>
+              <td>
+                <strong>Order Total</strong>
+              </td>
               <td>${order.order_total.toFixed(2)}</td>
             </tr>
           </tbody>

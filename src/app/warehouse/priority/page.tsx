@@ -1,4 +1,4 @@
-import { queryAll, tableExists } from "@/lib/db";
+import { supabase } from "@/lib/db";
 import Link from "next/link";
 
 /* ── Types ─────────────────────────────────────────────── */
@@ -25,56 +25,36 @@ export default async function WarehousePriorityPage({
   const { sort: sortParam } = await searchParams;
   const sort = sortParam === "recent" ? "recent" : "fraud";
 
-  if (!tableExists("order_predictions")) {
+  const orderCol =
+    sort === "recent" ? "order_datetime" : "fraud_probability";
+  const ascending = sort === "recent" ? false : false;
+
+  const { data: queue, error } = await supabase
+    .from("fraud_queue")
+    .select("*")
+    .order(orderCol, { ascending })
+    .limit(50)
+    .returns<QueueRow[]>();
+
+  if (error) {
     return (
       <div>
         <h1>Fraud Detection Queue</h1>
         <div className="card" style={{ borderColor: "var(--warning)" }}>
-          <h2>Missing Table</h2>
+          <h2>Setup Required</h2>
           <p>
-            The <code>order_predictions</code> table does not exist yet. To
-            create it, go to <Link href="/scoring">Run Scoring</Link> and click
-            the button, or run:
+            The <code>fraud_queue</code> view or <code>order_predictions</code>{" "}
+            table is not set up yet. Run scoring first via{" "}
+            <Link href="/scoring">Run Scoring</Link>, then create the view in
+            the Supabase SQL Editor using{" "}
+            <code>scripts/supabase-views.sql</code>.
           </p>
-          <pre
-            style={{
-              background: "#f1f5f9",
-              padding: "0.75rem",
-              borderRadius: "6px",
-              fontSize: "0.85rem",
-              marginTop: "0.5rem",
-            }}
-          >
-            sqlite3 shop.db &lt; scripts/seed-predictions.sql
-          </pre>
         </div>
       </div>
     );
   }
 
-  const orderBy =
-    sort === "recent"
-      ? "o.order_datetime DESC"
-      : "p.fraud_probability DESC, o.order_datetime ASC";
-
-  const queue = queryAll<QueueRow>(
-    `SELECT
-       o.order_id,
-       o.order_datetime,
-       o.order_total,
-       CASE WHEN s.shipment_id IS NOT NULL THEN 1 ELSE 0 END AS fulfilled,
-       c.customer_id,
-       c.full_name                    AS customer_name,
-       p.fraud_probability,
-       p.predicted_fraud,
-       p.prediction_timestamp
-     FROM orders o
-     JOIN customers c        ON c.customer_id = o.customer_id
-     JOIN order_predictions p ON p.order_id    = o.order_id
-     LEFT JOIN shipments s   ON s.order_id     = o.order_id
-     ORDER BY ${orderBy}
-     LIMIT 50`
-  );
+  const rows = queue ?? [];
 
   return (
     <div>
@@ -82,44 +62,69 @@ export default async function WarehousePriorityPage({
 
       <div className="card">
         <p>
-          This queue surfaces orders most likely to be fraudulent,
-          ranked by the predicted probability of fraud. Review staff
-          should investigate orders at the top of the list first to
-          minimise losses and protect customers.
+          This queue surfaces orders most likely to be fraudulent, ranked by the
+          predicted probability of fraud. Review staff should investigate orders
+          at the top of the list first to minimise losses and protect customers.
         </p>
 
         <fieldset style={{ marginTop: "0.75rem", border: "none", padding: 0 }}>
-          <legend style={{ fontWeight: 600, marginBottom: "0.4rem" }}>Sort by:</legend>
+          <legend style={{ fontWeight: 600, marginBottom: "0.4rem" }}>
+            Sort by:
+          </legend>
           <div style={{ display: "flex", gap: "1rem" }}>
             <Link
               href="/warehouse/priority?sort=fraud"
-              style={{ textDecoration: "none", color: "inherit", display: "flex", alignItems: "center", gap: "0.35rem" }}
+              style={{
+                textDecoration: "none",
+                color: "inherit",
+                display: "flex",
+                alignItems: "center",
+                gap: "0.35rem",
+              }}
             >
-              <span style={{
-                display: "inline-block", width: "16px", height: "16px",
-                borderRadius: "50%", border: "2px solid #6366f1",
-                background: sort === "fraud" ? "#6366f1" : "transparent",
-                boxShadow: sort === "fraud" ? "inset 0 0 0 3px white" : "none",
-              }} />
+              <span
+                style={{
+                  display: "inline-block",
+                  width: "16px",
+                  height: "16px",
+                  borderRadius: "50%",
+                  border: "2px solid #6366f1",
+                  background: sort === "fraud" ? "#6366f1" : "transparent",
+                  boxShadow:
+                    sort === "fraud" ? "inset 0 0 0 3px white" : "none",
+                }}
+              />
               Most Likely Fraud
             </Link>
             <Link
               href="/warehouse/priority?sort=recent"
-              style={{ textDecoration: "none", color: "inherit", display: "flex", alignItems: "center", gap: "0.35rem" }}
+              style={{
+                textDecoration: "none",
+                color: "inherit",
+                display: "flex",
+                alignItems: "center",
+                gap: "0.35rem",
+              }}
             >
-              <span style={{
-                display: "inline-block", width: "16px", height: "16px",
-                borderRadius: "50%", border: "2px solid #6366f1",
-                background: sort === "recent" ? "#6366f1" : "transparent",
-                boxShadow: sort === "recent" ? "inset 0 0 0 3px white" : "none",
-              }} />
+              <span
+                style={{
+                  display: "inline-block",
+                  width: "16px",
+                  height: "16px",
+                  borderRadius: "50%",
+                  border: "2px solid #6366f1",
+                  background: sort === "recent" ? "#6366f1" : "transparent",
+                  boxShadow:
+                    sort === "recent" ? "inset 0 0 0 3px white" : "none",
+                }}
+              />
               Most Recent
             </Link>
           </div>
         </fieldset>
       </div>
 
-      {queue.length === 0 ? (
+      {rows.length === 0 ? (
         <div className="card">
           <p className="text-muted text-center">
             No orders with predictions found. Place a new order via{" "}
@@ -143,7 +148,7 @@ export default async function WarehousePriorityPage({
               </tr>
             </thead>
             <tbody>
-              {queue.map((q) => (
+              {rows.map((q) => (
                 <tr key={q.order_id}>
                   <td>{q.order_id}</td>
                   <td>{q.customer_name}</td>
@@ -171,9 +176,7 @@ export default async function WarehousePriorityPage({
                   </td>
                   <td>
                     <span
-                      className={`badge ${
-                        q.predicted_fraud ? "red" : "green"
-                      }`}
+                      className={`badge ${q.predicted_fraud ? "red" : "green"}`}
                     >
                       {q.predicted_fraud ? "Yes" : "No"}
                     </span>

@@ -1,29 +1,45 @@
-import { queryAll } from "@/lib/db";
+import { supabase } from "@/lib/db";
 
-interface TableInfo {
-  cid: number;
-  name: string;
-  type: string;
-  notnull: number;
-  dflt_value: string | null;
-  pk: number;
+interface ColumnInfo {
+  ordinal_position: number;
+  column_name: string;
+  data_type: string;
+  is_nullable: string;
+  column_default: string | null;
 }
 
-export default function SchemaPage() {
-  const tables = queryAll<{ name: string }>(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-  );
+const APP_TABLES = [
+  "customers",
+  "products",
+  "orders",
+  "order_items",
+  "shipments",
+  "product_reviews",
+  "order_predictions",
+];
 
-  const schema = tables.map((t) => ({
-    table: t.name,
-    columns: queryAll<TableInfo>(`PRAGMA table_info("${t.name}")`),
-  }));
+export default async function SchemaPage() {
+  const schema: { table: string; columns: ColumnInfo[] }[] = [];
+
+  for (const table of APP_TABLES) {
+    const { data } = await supabase
+      .from("information_schema.columns" as string)
+      .select(
+        "ordinal_position, column_name, data_type, is_nullable, column_default"
+      )
+      .eq("table_schema", "public")
+      .eq("table_name", table)
+      .order("ordinal_position")
+      .returns<ColumnInfo[]>();
+
+    schema.push({ table, columns: data ?? [] });
+  }
 
   return (
     <div>
       <h1>Database Schema</h1>
       <p className="text-muted mb-1">
-        {tables.length} tables in shop.db
+        {APP_TABLES.length} tables in Supabase
       </p>
 
       {schema.map((s) => (
@@ -35,20 +51,20 @@ export default function SchemaPage() {
                 <th>#</th>
                 <th>Column</th>
                 <th>Type</th>
-                <th>Not Null</th>
+                <th>Nullable</th>
                 <th>Default</th>
-                <th>PK</th>
               </tr>
             </thead>
             <tbody>
               {s.columns.map((col) => (
-                <tr key={col.cid}>
-                  <td>{col.cid}</td>
-                  <td><strong>{col.name}</strong></td>
-                  <td>{col.type || "—"}</td>
-                  <td>{col.notnull ? "Yes" : "No"}</td>
-                  <td>{col.dflt_value ?? "—"}</td>
-                  <td>{col.pk ? "Yes" : ""}</td>
+                <tr key={col.ordinal_position}>
+                  <td>{col.ordinal_position}</td>
+                  <td>
+                    <strong>{col.column_name}</strong>
+                  </td>
+                  <td>{col.data_type}</td>
+                  <td>{col.is_nullable === "YES" ? "Yes" : "No"}</td>
+                  <td>{col.column_default ?? "—"}</td>
                 </tr>
               ))}
             </tbody>

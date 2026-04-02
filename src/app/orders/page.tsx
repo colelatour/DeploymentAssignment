@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import Link from "next/link";
-import { queryAll } from "@/lib/db";
+import { supabase } from "@/lib/db";
 import { getCustomerId } from "@/lib/getCustomerId";
 import SuccessBanner from "./SuccessBanner";
 
@@ -10,20 +10,8 @@ interface OrderRow {
   order_id: number;
   order_datetime: string;
   order_total: number;
-  fulfilled: number;
+  shipments: { shipment_id: number }[] | null;
 }
-
-/* ── SQL ───────────────────────────────────────────────── */
-//
-// SELECT o.order_id,
-//        o.order_datetime,
-//        o.order_total,
-//        CASE WHEN s.shipment_id IS NOT NULL THEN 1 ELSE 0 END AS fulfilled
-// FROM   orders o
-// LEFT JOIN shipments s ON s.order_id = o.order_id
-// WHERE  o.customer_id = ?
-// ORDER BY o.order_datetime DESC
-//
 
 /* ── Page ──────────────────────────────────────────────── */
 
@@ -40,17 +28,19 @@ export default async function OrdersPage({
   const params = await searchParams;
   const successOrderId = params.success ?? null;
 
-  const orders = queryAll<OrderRow>(
-    `SELECT o.order_id,
-            o.order_datetime,
-            o.order_total,
-            CASE WHEN s.shipment_id IS NOT NULL THEN 1 ELSE 0 END AS fulfilled
-     FROM   orders o
-     LEFT JOIN shipments s ON s.order_id = o.order_id
-     WHERE  o.customer_id = ?
-     ORDER BY o.order_datetime DESC`,
-    [customerId]
-  );
+  const { data: rawOrders } = await supabase
+    .from("orders")
+    .select("order_id, order_datetime, order_total, shipments(shipment_id)")
+    .eq("customer_id", customerId)
+    .order("order_datetime", { ascending: false })
+    .returns<OrderRow[]>();
+
+  const orders = (rawOrders ?? []).map((o) => ({
+    order_id: o.order_id,
+    order_datetime: o.order_datetime,
+    order_total: o.order_total,
+    fulfilled: o.shipments && o.shipments.length > 0 ? 1 : 0,
+  }));
 
   return (
     <div>

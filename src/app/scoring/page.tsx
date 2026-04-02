@@ -5,7 +5,7 @@ export default function ScoringPage() {
     <div>
       <h1>Run Scoring</h1>
       <p className="text-muted mb-1">
-        Run the fraud prediction model against all orders in shop.db.
+        Run the fraud prediction model against all orders.
         Results are written to the <code>order_predictions</code> table and
         used by the <strong>Fraud Detection Queue</strong>.
       </p>
