@@ -10,18 +10,25 @@ interface QueueRow {
   fulfilled: number;
   customer_id: number;
   customer_name: string;
-  late_delivery_probability: number;
-  predicted_late_delivery: number;
+  fraud_probability: number;
+  predicted_fraud: number;
   prediction_timestamp: string;
 }
 
 /* ── Page ──────────────────────────────────────────────── */
 
-export default function WarehousePriorityPage() {
+export default async function WarehousePriorityPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ sort?: string }>;
+}) {
+  const { sort: sortParam } = await searchParams;
+  const sort = sortParam === "recent" ? "recent" : "fraud";
+
   if (!tableExists("order_predictions")) {
     return (
       <div>
-        <h1>Late Delivery Priority Queue</h1>
+        <h1>Fraud Detection Queue</h1>
         <div className="card" style={{ borderColor: "var(--warning)" }}>
           <h2>Missing Table</h2>
           <p>
@@ -45,6 +52,11 @@ export default function WarehousePriorityPage() {
     );
   }
 
+  const orderBy =
+    sort === "recent"
+      ? "o.order_datetime DESC"
+      : "p.fraud_probability DESC, o.order_datetime ASC";
+
   const queue = queryAll<QueueRow>(
     `SELECT
        o.order_id,
@@ -52,38 +64,65 @@ export default function WarehousePriorityPage() {
        o.order_total,
        CASE WHEN s.shipment_id IS NOT NULL THEN 1 ELSE 0 END AS fulfilled,
        c.customer_id,
-       c.full_name                            AS customer_name,
-       p.late_delivery_probability,
-       p.predicted_late_delivery,
+       c.full_name                    AS customer_name,
+       p.fraud_probability,
+       p.predicted_fraud,
        p.prediction_timestamp
      FROM orders o
      JOIN customers c        ON c.customer_id = o.customer_id
      JOIN order_predictions p ON p.order_id    = o.order_id
      LEFT JOIN shipments s   ON s.order_id     = o.order_id
-     WHERE s.shipment_id IS NULL
-     ORDER BY p.late_delivery_probability DESC,
-              o.order_datetime ASC
+     ORDER BY ${orderBy}
      LIMIT 50`
   );
 
   return (
     <div>
-      <h1>Late Delivery Priority Queue</h1>
+      <h1>Fraud Detection Queue</h1>
 
       <div className="card">
         <p>
-          This queue surfaces unfulfilled orders most likely to arrive late,
-          ranked by the predicted probability of late delivery. Warehouse staff
-          should prioritise picking, packing, and dispatching orders at the top
-          of the list first to minimise the number of late shipments and improve
-          customer satisfaction.
+          This queue surfaces orders most likely to be fraudulent,
+          ranked by the predicted probability of fraud. Review staff
+          should investigate orders at the top of the list first to
+          minimise losses and protect customers.
         </p>
+
+        <fieldset style={{ marginTop: "0.75rem", border: "none", padding: 0 }}>
+          <legend style={{ fontWeight: 600, marginBottom: "0.4rem" }}>Sort by:</legend>
+          <div style={{ display: "flex", gap: "1rem" }}>
+            <Link
+              href="/warehouse/priority?sort=fraud"
+              style={{ textDecoration: "none", color: "inherit", display: "flex", alignItems: "center", gap: "0.35rem" }}
+            >
+              <span style={{
+                display: "inline-block", width: "16px", height: "16px",
+                borderRadius: "50%", border: "2px solid #6366f1",
+                background: sort === "fraud" ? "#6366f1" : "transparent",
+                boxShadow: sort === "fraud" ? "inset 0 0 0 3px white" : "none",
+              }} />
+              Most Likely Fraud
+            </Link>
+            <Link
+              href="/warehouse/priority?sort=recent"
+              style={{ textDecoration: "none", color: "inherit", display: "flex", alignItems: "center", gap: "0.35rem" }}
+            >
+              <span style={{
+                display: "inline-block", width: "16px", height: "16px",
+                borderRadius: "50%", border: "2px solid #6366f1",
+                background: sort === "recent" ? "#6366f1" : "transparent",
+                boxShadow: sort === "recent" ? "inset 0 0 0 3px white" : "none",
+              }} />
+              Most Recent
+            </Link>
+          </div>
+        </fieldset>
       </div>
 
       {queue.length === 0 ? (
         <div className="card">
           <p className="text-muted text-center">
-            No unfulfilled orders with predictions found. Place a new order via{" "}
+            No orders with predictions found. Place a new order via{" "}
             <Link href="/place-order">Place Order</Link>, then{" "}
             <Link href="/scoring">Run Scoring</Link> to see it appear here.
           </p>
@@ -98,8 +137,8 @@ export default function WarehousePriorityPage() {
                 <th>Order Date</th>
                 <th>Total</th>
                 <th>Fulfilled</th>
-                <th>Late Prob.</th>
-                <th>Predicted Late</th>
+                <th>Fraud Prob.</th>
+                <th>Predicted Fraud</th>
                 <th>Scored At</th>
               </tr>
             </thead>
@@ -120,23 +159,23 @@ export default function WarehousePriorityPage() {
                   <td>
                     <span
                       className={`badge ${
-                        q.late_delivery_probability >= 0.7
+                        q.fraud_probability >= 0.7
                           ? "red"
-                          : q.late_delivery_probability >= 0.4
+                          : q.fraud_probability >= 0.4
                           ? "yellow"
                           : "green"
                       }`}
                     >
-                      {(q.late_delivery_probability * 100).toFixed(0)}%
+                      {(q.fraud_probability * 100).toFixed(0)}%
                     </span>
                   </td>
                   <td>
                     <span
                       className={`badge ${
-                        q.predicted_late_delivery ? "red" : "green"
+                        q.predicted_fraud ? "red" : "green"
                       }`}
                     >
-                      {q.predicted_late_delivery ? "Yes" : "No"}
+                      {q.predicted_fraud ? "Yes" : "No"}
                     </span>
                   </td>
                   <td className="text-muted">{q.prediction_timestamp}</td>

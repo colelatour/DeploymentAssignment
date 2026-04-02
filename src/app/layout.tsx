@@ -24,8 +24,7 @@ export default function RootLayout({
             <Link href="/dashboard">Customer Dashboard</Link>
             <Link href="/place-order">Place Order</Link>
             <Link href="/orders">Order History</Link>
-            <Link href="/warehouse">Warehouse Queue</Link>
-            <Link href="/warehouse/priority">Priority Queue</Link>
+            <Link href="/warehouse/priority">Fraud Detection</Link>
             <Link href="/scoring">Run Scoring</Link>
           </nav>
           <main className="content">{children}</main>

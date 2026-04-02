@@ -36,11 +36,11 @@ export default function ScoringPanel() {
   return (
     <div>
       <div className="card">
-        <h2>Late-Delivery Prediction Model</h2>
+        <h2>Fraud Prediction Model</h2>
         <p style={{ fontSize: "0.9rem" }}>
           Clicking <strong>Run Scoring</strong> executes the Python inference
           script (<code>jobs/run_inference.py</code>) which scores every order
-          and writes predictions into the <code>order_predictions</code> table.
+          for fraud risk and writes predictions into the <code>order_predictions</code> table.
         </p>
         <button
           className="primary mt-1"
