@@ -69,6 +69,7 @@ function runPython(): Promise<{ stdout: string; stderr: string }> {
           timeout: TIMEOUT_MS,
           maxBuffer: 2 * 1024 * 1024, // 2 MB
           cwd: process.cwd(),
+          env: { ...process.env, PYTHONUNBUFFERED: "1" },
         },
         (error, stdout, stderr) => {
           if (error) {

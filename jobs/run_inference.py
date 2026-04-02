@@ -17,9 +17,17 @@ import sys
 import traceback
 from datetime import datetime, timezone
 
+# Force unbuffered output so nothing is lost if the process crashes
+sys.stdout.reconfigure(line_buffering=True)
+
 # Allow importing modeling.py from the project root
 PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, PROJECT_ROOT)
+
+
+def _step(msg: str) -> None:
+    """Print a progress checkpoint to stderr (always visible)."""
+    print(json.dumps({"step": msg}), file=sys.stderr, flush=True)
 
 
 def _load_env_local() -> None:
@@ -44,12 +52,12 @@ def get_supabase_client():
     url = os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
     key = os.environ.get("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY")
     if not url or not key:
-        print(json.dumps({"error": "Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY"}))
+        print(json.dumps({"error": "Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY"}), flush=True)
         sys.exit(1)
     try:
         from supabase import create_client
     except ImportError:
-        print(json.dumps({"error": "supabase package not installed. Run: pip install supabase"}))
+        print(json.dumps({"error": "supabase package not installed. Run: pip install supabase"}), flush=True)
         sys.exit(1)
     return create_client(url, key)
 
@@ -91,11 +99,10 @@ def score_order_heuristic(row: dict) -> float:
     return round(sigmoid(raw - 1.5), 4)
 
 
-def parse_datetime(value: str | None, fmt: str = "%Y-%m-%dT%H:%M:%S") -> datetime | None:
+def parse_datetime(value: str | None) -> datetime | None:
     """Parse a datetime string from Supabase (ISO 8601 variants)."""
     if not value:
         return None
-    # Try common Supabase formats
     for f in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.strptime(value[:26], f[:len(f)])
@@ -108,19 +115,20 @@ def parse_datetime(value: str | None, fmt: str = "%Y-%m-%dT%H:%M:%S") -> datetim
 
 
 def main() -> None:
+    _step("connecting to supabase")
     client = get_supabase_client()
 
-    # Try to import modeling.py and load the model
+    _step("loading model")
     use_model = False
     try:
         from modeling import predict_transaction, load_model
-        load_model()  # will raise FileNotFoundError if .sav missing
+        load_model()
         use_model = True
-        print(json.dumps({"info": "Using XGBoost model via modeling.py"}), file=sys.stderr)
+        _step("model loaded")
     except (ImportError, FileNotFoundError) as e:
-        print(json.dumps({"info": f"Model not available, using heuristic fallback: {e}"}), file=sys.stderr)
+        _step(f"model unavailable, using heuristic: {e}")
 
-    # Fetch all orders with nested customer and shipment data
+    _step("fetching orders")
     orders_resp = client.table("orders").select(
         "order_id, billing_zip, shipping_zip, shipping_state, payment_method, "
         "device_type, ip_country, promo_used, order_subtotal, shipping_fee, "
@@ -128,10 +136,10 @@ def main() -> None:
         "customers(gender, city, state, customer_segment, loyalty_tier, is_active, birthdate), "
         "shipments(carrier, shipping_method, distance_band, promised_days, actual_days, late_delivery)"
     ).execute()
-
     orders = orders_resp.data or []
+    _step(f"fetched {len(orders)} orders")
 
-    # Fetch all order_items and aggregate by order_id in Python
+    _step("fetching order_items")
     items_resp = client.table("order_items").select(
         "order_id, quantity, unit_price, product_id, line_total"
     ).execute()
@@ -155,59 +163,59 @@ def main() -> None:
         if item.get("unit_price") is not None:
             agg["unit_prices"].append(item["unit_price"])
         agg["line_total_sum"] += item.get("line_total") or 0.0
+    _step(f"fetched order_items for {len(items_by_order)} orders")
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     scored = 0
     errors = 0
     predictions = []
 
+    _step("scoring orders")
     for order in orders:
         customer = order.get("customers") or {}
         shipment = order.get("shipments") or {}
         agg = items_by_order.get(order["order_id"], {})
 
         row = {
-            "order_id":          order["order_id"],
-            "billing_zip":       order.get("billing_zip") or "",
-            "shipping_zip":      order.get("shipping_zip") or "",
-            "shipping_state":    order.get("shipping_state") or "",
-            "payment_method":    order.get("payment_method") or "card",
-            "device_type":       order.get("device_type") or "desktop",
-            "ip_country":        order.get("ip_country") or "US",
-            "promo_used":        order.get("promo_used") or 0,
-            "order_subtotal":    order.get("order_subtotal") or 0.0,
-            "shipping_fee":      order.get("shipping_fee") or 0.0,
-            "tax_amount":        order.get("tax_amount") or 0.0,
-            "order_total":       order.get("order_total") or 0.0,
-            "risk_score":        order.get("risk_score") or 0.0,
-            "order_datetime":    order.get("order_datetime") or "",
-            "gender":            customer.get("gender") or "Unknown",
-            "city":              customer.get("city") or "",
-            "customer_state":    customer.get("state") or "",
-            "customer_segment":  customer.get("customer_segment") or "standard",
-            "loyalty_tier":      customer.get("loyalty_tier") or "none",
+            "order_id":           order["order_id"],
+            "billing_zip":        order.get("billing_zip") or "",
+            "shipping_zip":       order.get("shipping_zip") or "",
+            "shipping_state":     order.get("shipping_state") or "",
+            "payment_method":     order.get("payment_method") or "card",
+            "device_type":        order.get("device_type") or "desktop",
+            "ip_country":         order.get("ip_country") or "US",
+            "promo_used":         order.get("promo_used") or 0,
+            "order_subtotal":     order.get("order_subtotal") or 0.0,
+            "shipping_fee":       order.get("shipping_fee") or 0.0,
+            "tax_amount":         order.get("tax_amount") or 0.0,
+            "order_total":        order.get("order_total") or 0.0,
+            "risk_score":         order.get("risk_score") or 0.0,
+            "order_datetime":     order.get("order_datetime") or "",
+            "gender":             customer.get("gender") or "Unknown",
+            "city":               customer.get("city") or "",
+            "customer_state":     customer.get("state") or "",
+            "customer_segment":   customer.get("customer_segment") or "standard",
+            "loyalty_tier":       customer.get("loyalty_tier") or "none",
             "customer_is_active": customer.get("is_active") if customer.get("is_active") is not None else 1,
-            "birthdate":         customer.get("birthdate"),
-            "carrier":           shipment.get("carrier") or "USPS",
-            "shipping_method":   shipment.get("shipping_method") or "standard",
-            "distance_band":     shipment.get("distance_band") or "regional",
-            "promised_days":     shipment.get("promised_days") if shipment.get("promised_days") is not None else 5,
-            "actual_days":       shipment.get("actual_days") if shipment.get("actual_days") is not None else 5,
-            "late_delivery":     shipment.get("late_delivery") if shipment.get("late_delivery") is not None else 0,
-            "total_units":       agg.get("total_units") or 0,
-            "line_items":        agg.get("line_items") or 0,
-            "distinct_products": len(agg.get("distinct_products") or set()),
-            "avg_unit_price":    (sum(agg["unit_prices"]) / len(agg["unit_prices"])) if agg.get("unit_prices") else 0.0,
-            "line_total_sum":    agg.get("line_total_sum") or 0.0,
+            "birthdate":          customer.get("birthdate"),
+            "carrier":            shipment.get("carrier") or "USPS",
+            "shipping_method":    shipment.get("shipping_method") or "standard",
+            "distance_band":      shipment.get("distance_band") or "regional",
+            "promised_days":      shipment.get("promised_days") if shipment.get("promised_days") is not None else 5,
+            "actual_days":        shipment.get("actual_days") if shipment.get("actual_days") is not None else 5,
+            "late_delivery":      shipment.get("late_delivery") if shipment.get("late_delivery") is not None else 0,
+            "total_units":        agg.get("total_units") or 0,
+            "line_items":         agg.get("line_items") or 0,
+            "distinct_products":  len(agg.get("distinct_products") or set()),
+            "avg_unit_price":     (sum(agg["unit_prices"]) / len(agg["unit_prices"])) if agg.get("unit_prices") else 0.0,
+            "line_total_sum":     agg.get("line_total_sum") or 0.0,
         }
 
         if use_model:
             try:
-                from datetime import date
                 if row["birthdate"]:
                     birth = datetime.strptime(row["birthdate"][:10], "%Y-%m-%d").date()
-                    order_date_str = row["order_datetime"][:10]
-                    order_date = datetime.strptime(order_date_str, "%Y-%m-%d").date()
+                    order_date = datetime.strptime(row["order_datetime"][:10], "%Y-%m-%d").date()
                     age = (order_date - birth).days // 365
                 else:
                     age = 30
@@ -217,14 +225,13 @@ def main() -> None:
                 order_dayofweek = order_dt.weekday() if order_dt else 0
 
                 payload = {**row, "customer_age": age, "order_hour": order_hour, "order_dayofweek": order_dayofweek}
-
                 result = predict_transaction(payload)
                 prob = result["fraud_probability"]
                 predicted_fraud = result["is_fraud"]
             except Exception as e:
                 errors += 1
                 if errors <= 3:
-                    print(json.dumps({"warning": f"Model error on order {row['order_id']}: {e}"}), file=sys.stderr)
+                    print(json.dumps({"warning": f"Model error on order {row['order_id']}: {e}"}), file=sys.stderr, flush=True)
                 prob = score_order_heuristic(row)
                 predicted_fraud = 1 if prob >= 0.5 else 0
         else:
@@ -239,7 +246,7 @@ def main() -> None:
         })
         scored += 1
 
-    # Batch upsert all predictions to Supabase
+    _step(f"writing {len(predictions)} predictions to supabase")
     if predictions:
         client.table("order_predictions").upsert(
             predictions,
@@ -249,12 +256,13 @@ def main() -> None:
     output = {"scored": scored, "timestamp": now}
     if errors:
         output["model_errors"] = errors
-    print(json.dumps(output))
+    print(json.dumps(output), flush=True)
+    _step("done")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(json.dumps({"error": str(exc), "traceback": traceback.format_exc()}))
+        print(json.dumps({"error": str(exc), "traceback": traceback.format_exc()}), flush=True)
         sys.exit(1)
