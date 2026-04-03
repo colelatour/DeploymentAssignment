@@ -1,13 +1,6 @@
 services:
   - type: web
-    name: deployment-assignment
-    runtime: node
-    buildCommand: npm install && pip install -r requirements.txt && npm run build
-    startCommand: npm start
-    envVars:
-      - key: NEXT_PUBLIC_SUPABASE_URL
-        sync: false
-      - key: NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY
-        sync: false
-      - key: NODE_VERSION
-        value: 20
+    name: fraud-scoring-service
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn scoring_service:app --host 0.0.0.0 --port $PORT

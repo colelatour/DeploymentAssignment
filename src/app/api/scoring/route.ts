@@ -78,12 +78,10 @@ export async function POST() {
       };
     });
 
-    // 4. Call the Vercel Python function
-    const host = process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : "http://localhost:3000";
+    // 4. Call the Python scoring service (Render) or local fallback
+    const scoringUrl = process.env.SCORING_SERVICE_URL ?? "http://localhost:8001";
 
-    const scoreRes = await fetch(`${host}/api/score`, {
+    const scoreRes = await fetch(`${scoringUrl}/score`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ orders }),
