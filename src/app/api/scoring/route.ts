@@ -1,14 +1,9 @@
 import { NextResponse } from "next/server";
-import { execFile } from "node:child_process";
-import path from "node:path";
 import { supabase } from "@/lib/db";
-
-const SCRIPT = path.join(process.cwd(), "jobs", "run_inference.py");
-const TIMEOUT_MS = 60_000;
 
 export async function POST() {
   try {
-    // 1. Fetch all data from Supabase (Node already has a working connection)
+    // 1. Fetch all data from Supabase
     const [ordersRes, itemsRes] = await Promise.all([
       supabase.from("orders").select(
         "order_id, billing_zip, shipping_zip, shipping_state, payment_method, " +
@@ -42,7 +37,7 @@ export async function POST() {
       agg.line_total_sum += item.line_total ?? 0;
     }
 
-    // 3. Flatten into the shape Python expects
+    // 3. Flatten into the shape the scoring function expects
     const orders = (ordersRes.data ?? []).map((o: any) => {
       const customer = Array.isArray(o.customers) ? (o.customers[0] ?? {}) : (o.customers ?? {});
       const shipment = Array.isArray(o.shipments) ? (o.shipments[0] ?? {}) : (o.shipments ?? {});
@@ -83,25 +78,27 @@ export async function POST() {
       };
     });
 
-    // 4. Run Python — pipe order data in via stdin, get predictions from stdout
-    const { stdout, stderr } = await runPython(JSON.stringify(orders));
+    // 4. Call the Vercel Python function
+    const host = process.env.VERCEL_URL
+      ? `https://${process.env.VERCEL_URL}`
+      : "http://localhost:3000";
 
-    let result: any = null;
-    for (const line of stdout.trim().split("\n").reverse()) {
-      try {
-        const parsed = JSON.parse(line);
-        if (parsed.error) {
-          return NextResponse.json({ status: "error", message: parsed.error, detail: parsed.traceback, stderr }, { status: 500 });
-        }
-        if (typeof parsed.scored === "number") { result = parsed; break; }
-      } catch { /* not JSON */ }
+    const scoreRes = await fetch(`${host}/api/score`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ orders }),
+    });
+
+    if (!scoreRes.ok) {
+      const text = await scoreRes.text();
+      throw new Error(`Scoring function error ${scoreRes.status}: ${text}`);
     }
 
-    if (!result) {
-      return NextResponse.json({ status: "error", message: "No output from Python script", stdout, stderr }, { status: 500 });
-    }
+    const result = await scoreRes.json();
 
-    // 5. Write predictions back to Supabase from Node
+    if (result.error) throw new Error(result.error);
+
+    // 5. Write predictions back to Supabase
     const { error: upsertError } = await supabase
       .from("order_predictions")
       .upsert(result.predictions, { onConflict: "order_id" });
@@ -112,45 +109,11 @@ export async function POST() {
       status: "success",
       scored: result.scored,
       timestamp: result.timestamp,
-      stderr: stderr.trim() || null,
+      model_errors: result.model_errors ?? null,
     });
 
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return NextResponse.json({ status: "error", message }, { status: 500 });
   }
-}
-
-function runPython(input: string): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const tryCommand = (cmd: string) => {
-      const child = execFile(
-        cmd,
-        ["-u", SCRIPT],
-        {
-          timeout: TIMEOUT_MS,
-          maxBuffer: 10 * 1024 * 1024,
-          cwd: process.cwd(),
-          env: { ...process.env, PYTHONUNBUFFERED: "1" },
-        },
-        (error, stdout, stderr) => {
-          if (error) {
-            if (cmd === "python3" && error.message.includes("ENOENT")) {
-              tryCommand("python");
-              return;
-            }
-            (error as any).stderr = stderr;
-            (error as any).stdout = stdout;
-            reject(error);
-            return;
-          }
-          resolve({ stdout, stderr });
-        }
-      );
-      // Write order data to Python's stdin
-      child.stdin?.write(input);
-      child.stdin?.end();
-    };
-    tryCommand("python3");
-  });
 }
